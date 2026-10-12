@@ -1,316 +1,92 @@
-name: build-strata-engine
+name: Build Strata for A100 (sm_80)
 
 on:
   workflow_dispatch:
-    inputs:
-      ref:
-        description: "Branch, tag or commit to build (empty = the branch selected above)"
-        required: false
-        default: ""
-      cuda_archs:
-        description: "CUDA architectures, ';'-separated: 75 T4, 80 A100, 86 RTX 30, 89 L4 and RTX 40, 120 RTX 50 and RTX PRO 6000. Empty = the repository variable ENGINE_ARCHS, else 80. Each one adds build time"
-        required: false
-        default: ""
   push:
     branches: [main]
     paths:
-      - "CMakeLists.txt"
-      - "cmake/**"
-      - "src/**"
-      - "include/**"
-      - "third_party/**"
-      - "tools/vision/**"
-      - "setup.py"
-      - "requirements.txt"
-      - ".github/workflows/build-engine.yml"
-
-permissions:
-  contents: write
-
-concurrency:
-  group: engine-release
-  cancel-in-progress: false
+      - '.github/workflows/build-a100.yml'
 
 jobs:
-  # The architecture list is the manual input, else the repository variable ENGINE_ARCHS (Settings > Secrets and
-  # variables > Actions > Variables), else 80.  Set the variable so that a push-triggered build keeps your list.
-  prepare:
+  build-a100:
     runs-on: ubuntu-22.04
-    outputs:
-      version: ${{ steps.info.outputs.version }}
-      sha: ${{ steps.info.outputs.sha }}
-      archs: ${{ steps.info.outputs.archs }}
+
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.sha }}
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
-      - id: info
-        env:
-          ARCHS_INPUT: ${{ inputs.cuda_archs || vars.ENGINE_ARCHS || '80' }}
-        run: |
-          version=$(sed -n 's/^project(strata VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt | head -n 1)
-          if [ -z "$version" ]; then
-            echo "CMakeLists.txt has no 'project(strata VERSION x.y.z)' line" >&2
-            exit 1
-          fi
-          {
-            echo "version=$version"
-            echo "sha=$(git rev-parse HEAD)"
-            echo "archs=$ARCHS_INPUT"
-          } >> "$GITHUB_OUTPUT"
-          echo "Strata engine $version from $(git rev-parse --short HEAD), architectures: $ARCHS_INPUT"
+    - name: Install CUDA Toolkit 12.6
+      uses: Jimver/cuda-toolkit@v0.2.18
+      with:
+        cuda: '12.6.0'
+        method: 'network'
 
-  build:
-    name: Build the CUDA ${{ matrix.toolkit }} engine
-    needs: prepare
-    # the CUDA 12 asset is optional: if that build fails, the CUDA 13 release is still published
-    continue-on-error: ${{ matrix.toolkit == '12' }}
-    runs-on: ubuntu-22.04
-    timeout-minutes: 300
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - toolkit: "13"
-            image: nvidia/cuda:13.0.0-devel-ubuntu22.04
-            asset: strata-linux-x64.zip
-          - toolkit: "12"
-            image: nvidia/cuda:12.8.1-devel-ubuntu22.04
-            asset: strata-linux-x64-cuda12.zip
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.prepare.outputs.sha }}
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake ninja-build python3 python3-venv python3-pip git
 
-      - name: Free disk space (the CUDA image and the build need about 25 GB)
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
+    - name: Setup Python environment
+      run: |
+        python3 -m venv .venv
+        source .venv/bin/activate
+        pip install --upgrade pip setuptools wheel
 
-      - name: Build and pack in the CUDA image
-        env:
-          TOOLKIT: ${{ matrix.toolkit }}
-          ASSET: ${{ matrix.asset }}
-          IMAGE: ${{ matrix.image }}
-          ARCHS: ${{ needs.prepare.outputs.archs }}
-        run: |
-          cat > "$RUNNER_TEMP/ci_build_engine.py" <<'PY'
-          #!/usr/bin/env python3
-          """Build the Strata CUDA engine and pack it as a release asset that `setup.py --prebuilt` can download.
+    - name: Build Strata for A100 (sm_80)
+      run: |
+        source .venv/bin/activate
 
-          It uses setup.py's own recipe (its CMake flags, the pinned llama.cpp, the image encoder), with two changes
-          that make the result shareable:
+        # Install PyTorch with CUDA
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
-            * STRATA_PORTABLE=ON is always passed: an AVX2 baseline with no -march=native.  setup.py builds for the PC
-              it runs on, but a binary built on a CI runner can stop with "illegal instruction" on another CPU.
-            * one binary holds every GPU architecture in --archs, so a single download serves every card in the list.
+        # Set CUDA architecture for A100
+        export CUDA_ARCHITECTURES=80
+        export CMAKE_CUDA_ARCHITECTURES=80
+        export TORCH_CUDA_ARCH_LIST="8.0"
 
-          The zip keeps strata, strata-vision and BUILD.json at its top level, which is what setup.py's get_prebuilt
-          extracts and checks.  Run it from the repository root, with the repository's requirements installed:
+        # Build (without starting server)
+        ./setup.sh --yes --family qwen --model IQ2_XS --no-start || true
 
-              .venv/bin/python ci_build_engine.py --toolkit 13 --archs "75;80;86;89;120" --asset strata-linux-x64.zip
-          """
-          import argparse
-          import hashlib
-          import json
-          import os
-          import re
-          import subprocess
-          import sys
-          import zipfile
-          from pathlib import Path
+    - name: Package build
+      run: |
+        tar -czf strata-a100-sm80.tar.gz \
+          --exclude=.git \
+          --exclude=Strata-data \
+          --exclude=*.tar.gz \
+          .
 
-          ROOT = Path.cwd()
-          sys.path.insert(0, str(ROOT))
-          import setup as S  # noqa: E402  the installer's own helpers: flags, llama.cpp pin, version, file names
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: strata-a100-sm80-build
+        path: strata-a100-sm80.tar.gz
+        retention-days: 90
 
+    - name: Create Release
+      if: github.ref == 'refs/heads/main'
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: a100-build-${{ github.run_number }}
+        name: Strata A100 Build #${{ github.run_number }}
+        body: |
+          ## Strata for NVIDIA A100 (sm_80)
 
-          def cmake_build(src: Path, bdir: Path, target: str, defs: list) -> None:
-              cmake, ninja = S.find_tool("cmake"), S.find_tool("ninja")
-              if cmake is None or ninja is None:
-                  raise SystemExit("cmake / ninja not found: install requirements.txt into this Python")
-              subprocess.run([cmake, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}", "-S", str(src), "-B", str(bdir),
-                              "-DCMAKE_BUILD_TYPE=Release", *defs], check=True)
-              build = [cmake, "--build", str(bdir), "--target", target, "-j", str(os.cpu_count() or 4)]
-              for attempt in (1, 2):  # ptxas sometimes fails once on a PTX file it just wrote (setup.py, issue #45)
-                  if subprocess.run(build).returncode == 0:
-                      return
-                  print(f"{target}: build stopped on attempt {attempt}", flush=True)
-              raise SystemExit(f"{target}: build failed")
+          **Optimized for:**
+          - NVIDIA A100 80GB (Compute Capability 8.0)
+          - CUDA 12.6
+          - Ubuntu 22.04 / Google Colab
 
+          **Installation on Google Colab:**
+          ```bash
+          !wget https://github.com/${{ github.repository }}/releases/latest/download/strata-a100-sm80.tar.gz
+          !tar -xzf strata-a100-sm80.tar.gz
+          !cd strata-a100-sm80 && ./setup.sh --yes --family qwen --model IQ2_XS --context 131072
+          ```
 
-          def build_engine(toolkit: int, archs: list, nvcc: str, llama: Path) -> Path:
-              bdir = ROOT / ("build-cuda12" if toolkit == 12 else "build")
-              cmake_build(ROOT, bdir, "strata", [
-                  "-DSTRATA_ENABLE_CUDA=ON",
-                  "-DSTRATA_BUILD_TESTS=OFF",
-                  "-DSTRATA_PORTABLE=ON",
-                  f"-DCMAKE_CUDA_ARCHITECTURES={';'.join(map(str, archs))}",
-                  f"-DCMAKE_CUDA_COMPILER={nvcc}",
-                  *S.toolkit_root_defs(nvcc),
-                  f"-DSTRATA_GGML_DIR={llama}",
-                  *S.host_compiler_defs(True),
-                  *S.engine_defs(archs, toolkit),  # the CUDA 12 engine gets -DSTRATA_EXPERIMENTAL_SM60=ON, as in setup.py
-              ])
-              return bdir / S.EXE
-
-
-          def build_vision(toolkit: int, archs: list, nvcc: str, llama: Path) -> Path:
-              bdir = ROOT / ("build-vision-cuda12" if toolkit == 12 else "build-vision")
-              cmake_build(ROOT / "tools" / "vision", bdir, "strata-vision", [
-                  f"-DLLAMA_DIR={llama}",
-                  "-DSTRATA_VISION_CUDA=ON",
-                  "-DSTRATA_PORTABLE=ON",
-                  f"-DCMAKE_CUDA_ARCHITECTURES={';'.join(map(str, archs))}",
-                  f"-DCMAKE_CUDA_COMPILER={nvcc}",
-                  *S.toolkit_root_defs(nvcc),
-                  *S.host_compiler_defs(True),
-              ])
-              return bdir / "bin" / S.VEXE
-
-
-          def package(engine: Path, vision: Path, toolkit: int, archs: list, asset: str, out: Path) -> Path:
-              meta = {
-                  "source": "release",  # setup.py: anything but "local" is a ready-made engine, so it is not compiled again
-                  "version": S.source_version(),
-                  "archs": archs,
-                  "vision": "gpu",
-                  "vision_archs": archs,
-                  "backend": "cuda",
-                  "cuda": toolkit,
-              }
-              if toolkit == 12:
-                  meta["toolkit"] = 12
-              out.mkdir(parents=True, exist_ok=True)
-              zpath = out / asset
-              zpath.unlink(missing_ok=True)
-              with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
-                  z.write(engine, S.EXE)
-                  z.write(vision, S.VEXE)
-                  z.writestr("BUILD.json", json.dumps(meta, indent=1) + "\n")
-              return zpath
-
-
-          def verify(zpath: Path) -> None:
-              """Read the archive the way setup.py's get_prebuilt does, and refuse to publish one it would reject."""
-              with zipfile.ZipFile(zpath) as z:
-                  missing = {S.EXE, S.VEXE, "BUILD.json"} - set(z.namelist())
-                  if missing:
-                      raise SystemExit(f"{zpath.name}: {sorted(missing)} must be at the top level of the archive")
-                  meta = json.loads(z.read("BUILD.json"))
-                  exe = z.read(S.EXE)
-              if meta.get("source") == "local":
-                  raise SystemExit("BUILD.json says source=local: setup.py would compile instead of downloading")
-              have = tuple(int(x) for x in str(meta["version"]).split(".")[:4] if x.isdigit())
-              if have < S.MIN_ENGINE:
-                  raise SystemExit(f"engine {meta['version']} is older than setup.py's MIN_ENGINE {S.MIN_ENGINE}")
-              stamp = re.search(rb"engine=(\d+\.\d+\.\d+(?:\.\d+)?)\n", exe)  # the version setup.py reads back from the binary
-              if not stamp or stamp.group(1).decode() != str(meta["version"]):
-                  raise SystemExit("the binary's own version stamp does not match BUILD.json")
-              digest = hashlib.sha256(zpath.read_bytes()).hexdigest()
-              print(f"{zpath.name}: engine {meta['version']}, sm_{' sm_'.join(map(str, meta['archs']))}, "
-                    f"CUDA {meta['cuda']}, {zpath.stat().st_size / 2**20:.0f} MiB, sha256 {digest}", flush=True)
-
-
-          def parse_archs(text: str, toolkit: int) -> list:
-              archs = sorted({int(x) for x in text.split(";") if x.strip()})
-              if toolkit == 12 and any(a >= 120 for a in archs):
-                  print("CUDA 12 engine: sm_120 left out (setup.py's CUDA 12.8 build crashed on it, #220)", flush=True)
-                  archs = [a for a in archs if a < 120]
-              if not archs or archs[0] < S.CUDA13_MIN_ARCH:
-                  raise SystemExit(f"architectures must be {S.CUDA13_MIN_ARCH} or newer, got {text!r}")
-              return archs
-
-
-          def main() -> None:
-              ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-              ap.add_argument("--toolkit", type=int, choices=(12, 13), required=True)
-              ap.add_argument("--archs", required=True, help='compute capabilities, ";"-separated, e.g. "75;80;86;89;120"')
-              ap.add_argument("--asset", required=True, help="release file name, e.g. strata-linux-x64.zip")
-              ap.add_argument("--out", type=Path, default=Path("dist"))
-              a = ap.parse_args()
-
-              archs = parse_archs(a.archs, a.toolkit)
-
-              nvcc, nvcc_ver = S.find_nvcc()
-              if not nvcc or not nvcc_ver or nvcc_ver[0] != a.toolkit:
-                  raise SystemExit(f"need nvcc of CUDA {a.toolkit}, found: {nvcc} {nvcc_ver}")
-              llama = S.get_llama_cpp()
-              print(f"nvcc {nvcc} (CUDA {nvcc_ver[0]}.{nvcc_ver[1]}), llama.cpp {S.LLAMA_CPP_COMMIT[:7]}, "
-                    f"Strata {S.source_version()}", flush=True)
-
-              engine = build_engine(a.toolkit, archs, nvcc, llama)
-              vision = build_vision(a.toolkit, archs, nvcc, llama)
-              zpath = package(engine, vision, a.toolkit, archs, a.asset, a.out)
-              verify(zpath)
-              subprocess.run(["ldd", str(engine)], check=False)  # for the log: what the engine loads at run time
-
-
-          if __name__ == "__main__":
-              main()
-          PY
-          cat > "$RUNNER_TEMP/build_in_container.sh" <<'SH'
-          set -euo pipefail
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update -qq
-          apt-get install -y -qq --no-install-recommends build-essential ca-certificates python3 python3-venv python3-pip >/dev/null
-          cd /work
-          python3 -m venv .venv
-          .venv/bin/pip install -q --upgrade pip
-          .venv/bin/pip install -q -r requirements.txt
-          nvcc --version | tail -n 2
-          .venv/bin/python /ci/ci_build_engine.py --toolkit "$TOOLKIT" --archs "$ARCHS" --asset "$ASSET" --out dist
-          SH
-          docker run --rm \
-            -e TOOLKIT -e ARCHS -e ASSET \
-            -v "$GITHUB_WORKSPACE:/work" -w /work \
-            -v "$RUNNER_TEMP:/ci:ro" \
-            "$IMAGE" bash /ci/build_in_container.sh
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: engine-cuda${{ matrix.toolkit }}
-          path: dist/${{ matrix.asset }}
-          retention-days: 3
-
-  release:
-    needs: [prepare, build]
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: engine-cuda*
-          path: dist
-          merge-multiple: true
-
-      - name: Publish the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-          SHA: ${{ needs.prepare.outputs.sha }}
-          ARCHS: ${{ needs.prepare.outputs.archs }}
-        run: |
-          set -euo pipefail
-          tag="engine-v${VERSION}"
-          ls -lh dist/
-          if [ ! -f dist/strata-linux-x64.zip ]; then
-            echo "the CUDA 13 asset is missing: nothing to publish" >&2
-            exit 1
-          fi
-          {
-            echo "Strata engine ${VERSION}, built by GitHub Actions from commit ${SHA:0:7}."
-            echo
-            echo "- strata-linux-x64.zip: CUDA 13.0 (drivers 580 and newer), one binary for sm_${ARCHS//;/, sm_}, with the image encoder."
-            if [ -f dist/strata-linux-x64-cuda12.zip ]; then
-              echo "- strata-linux-x64-cuda12.zip: CUDA 12 build for drivers older than 580, the same list without sm_120 (experimental)."
-            fi
-            echo
-            echo "Install without compiling:"
-            echo
-            echo "    ./setup.sh --prebuilt https://github.com/${GH_REPO}/releases/latest/download/"
-          } > notes.md
-          gh release delete "$tag" --yes --cleanup-tag >/dev/null 2>&1 || true
-          gh release create "$tag" dist/*.zip --target "$SHA" --latest \
-            --title "Strata engine ${VERSION}" --notes-file notes.md
+          **Expected Performance:**
+          - Speed: 90-140 tok/s
+          - Model: IQ2_XS (48GB)
+          - Context: 131K tokens
+        files: strata-a100-sm80.tar.gz
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
