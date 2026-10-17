@@ -72,7 +72,6 @@ jobs:
               nvcc, _ = S.find_nvcc()
               llama = S.get_llama_cpp()
 
-              # Для sm_75 на старых проверках setup.py снимаем ограничение < 80, если оно есть
               bdir = ROOT / f"build-{archs[0]}"
               cmake_build(ROOT, bdir, "strata", [
                   "-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_PORTABLE=ON",
@@ -114,7 +113,7 @@ jobs:
           name: strata-${{ matrix.name }}
           path: dist/${{ matrix.asset }}
 
-release:
+  release:
     needs: build
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-22.04
