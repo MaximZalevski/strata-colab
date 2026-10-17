@@ -114,11 +114,13 @@ jobs:
           name: strata-${{ matrix.name }}
           path: dist/${{ matrix.asset }}
 
-  release:
+release:
     needs: build
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-22.04
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -132,5 +134,7 @@ jobs:
           gh release create "$tag" \
             artifacts/strata-a100.zip \
             artifacts/strata-t4.zip \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
             --title "Strata Builds ($tag): A100 (sm_80) & T4 (sm_75)" \
             --notes "Precompiled CUDA 13 engines: strata-a100.zip (sm_80) and strata-t4.zip (sm_75)"
