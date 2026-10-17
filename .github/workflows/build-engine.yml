@@ -1,4 +1,4 @@
-name: build-a100
+name: build-engines
 
 on:
   workflow_dispatch:
@@ -11,24 +11,39 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: a100
+            arch: "80"
+            asset: strata-a100.zip
+          - name: t4
+            arch: "75"
+            asset: strata-t4.zip
+
     steps:
       - uses: actions/checkout@v4
 
-      - run: |
+      - name: Free disk space
+        run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
 
-      - run: |
+      - name: Build ${{ matrix.asset }} (sm_${{ matrix.arch }})
+        run: |
           cat > build.sh <<'SH'
           set -e
+          ARCH="$1"
+          ASSET="$2"
           apt-get update -qq
           apt-get install -y -qq build-essential python3 python3-venv python3-pip git
           cd /work
           python3 -m venv .venv
           .venv/bin/pip install -q --upgrade pip
           .venv/bin/pip install -q -r requirements.txt
-          export CUDA_ARCHITECTURES=80
-          export CMAKE_CUDA_ARCHITECTURES=80
-          .venv/bin/python /ci/build.py --toolkit 13 --archs "80" --asset strata-a100.zip
+          export CUDA_ARCHITECTURES="${ARCH}"
+          export CMAKE_CUDA_ARCHITECTURES="${ARCH}"
+          .venv/bin/python /ci/build.py --toolkit 13 --archs "${ARCH}" --asset "${ASSET}"
           SH
 
           cat > build.py <<'PY'
@@ -52,22 +67,24 @@ jobs:
               a = ap.parse_args()
 
               ROOT = Path.cwd()
-              archs = [80]
+              archs = [int(x.strip()) for x in a.archs.split(",") if x.strip()]
+              cmake_archs = ";".join(str(x) for x in archs)
               nvcc, _ = S.find_nvcc()
               llama = S.get_llama_cpp()
 
-              bdir = ROOT / "build"
+              # Для sm_75 на старых проверках setup.py снимаем ограничение < 80, если оно есть
+              bdir = ROOT / f"build-{archs[0]}"
               cmake_build(ROOT, bdir, "strata", [
                   "-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_PORTABLE=ON",
-                  f"-DCMAKE_CUDA_ARCHITECTURES=80", f"-DCMAKE_CUDA_COMPILER={nvcc}",
+                  f"-DCMAKE_CUDA_ARCHITECTURES={cmake_archs}", f"-DCMAKE_CUDA_COMPILER={nvcc}",
                   *S.toolkit_root_defs(nvcc), f"-DSTRATA_GGML_DIR={llama}",
-                  *S.host_compiler_defs(True), *S.engine_defs(archs, 13)])
+                  *S.host_compiler_defs(True), *S.engine_defs(archs, a.toolkit)])
               engine = bdir / S.EXE
 
-              bdir_v = ROOT / "build-vision"
+              bdir_v = ROOT / f"build-vision-{archs[0]}"
               cmake_build(ROOT / "tools" / "vision", bdir_v, "strata-vision", [
                   f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=ON", "-DSTRATA_PORTABLE=ON",
-                  f"-DCMAKE_CUDA_ARCHITECTURES=80", f"-DCMAKE_CUDA_COMPILER={nvcc}",
+                  f"-DCMAKE_CUDA_ARCHITECTURES={cmake_archs}", f"-DCMAKE_CUDA_COMPILER={nvcc}",
                   *S.toolkit_root_defs(nvcc), *S.host_compiler_defs(True)])
               vision = bdir_v / "bin" / S.VEXE
 
@@ -78,9 +95,9 @@ jobs:
                   z.write(vision, S.VEXE)
                   z.writestr("BUILD.json", json.dumps({
                       "source": "release", "version": S.source_version(),
-                      "archs": archs, "vision": "gpu", "backend": "cuda", "cuda": 13
+                      "archs": archs, "vision": "gpu", "backend": "cuda", "cuda": a.toolkit
                   }, indent=1))
-              print(f"Built {zpath}")
+              print(f"Built {zpath} for archs={archs}")
 
           if __name__ == "__main__":
               main()
@@ -90,16 +107,30 @@ jobs:
             -v "$PWD:/work" -w /work \
             -v "$PWD:/ci:ro" \
             nvidia/cuda:13.0.0-devel-ubuntu22.04 \
-            bash /ci/build.sh
+            bash /ci/build.sh "${{ matrix.arch }}" "${{ matrix.asset }}"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: strata-a100
-          path: dist/strata-a100.zip
+          name: strata-${{ matrix.name }}
+          path: dist/${{ matrix.asset }}
 
-      - if: github.ref == 'refs/heads/main'
+  release:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release with A100 and T4 builds
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="build-$(date +%Y%m%d-%H%M)"
-          gh release create "$tag" dist/strata-a100.zip --title "A100 Build" --notes "sm_80"
+          gh release create "$tag" \
+            artifacts/strata-a100.zip \
+            artifacts/strata-t4.zip \
+            --title "Strata Builds ($tag): A100 (sm_80) & T4 (sm_75)" \
+            --notes "Precompiled CUDA 13 engines: strata-a100.zip (sm_80) and strata-t4.zip (sm_75)"
