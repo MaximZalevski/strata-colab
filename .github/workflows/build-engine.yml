@@ -41,6 +41,7 @@ jobs:
           python3 -m venv .venv
           .venv/bin/pip install -q --upgrade pip
           .venv/bin/pip install -q -r requirements.txt
+          .venv/bin/pip install -q -r requirements-build.txt
           export CUDA_ARCHITECTURES="${ARCH}"
           export CMAKE_CUDA_ARCHITECTURES="${ARCH}"
           .venv/bin/python /ci/build.py --toolkit 13 --archs "${ARCH}" --asset "${ASSET}"
